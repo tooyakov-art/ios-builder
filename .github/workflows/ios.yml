@@ -1,0 +1,241 @@
+# Сборка iOS → TestFlight на бесплатном macOS-раннере (репозиторий публичный, код приложения — закрытый).
+# Код приложения сюда не попадает: клонируется на раннер по deploy key (только чтение) и умирает вместе с машиной.
+# Публичный лог — только «ok / упал» по шагам; полный лог — зашифрованный артефакт (живёт 2 дня).
+#
+# Секреты (Settings → Secrets → Actions):
+#   ONETAP_REPO, ONETAP_DEPLOY_KEY          — какой закрытый репо клонировать и ключ только на чтение
+#   APP_STORE_CONNECT_ISSUER_ID, APP_STORE_CONNECT_KEY_IDENTIFIER,
+#   APP_STORE_CONNECT_PRIVATE_KEY (.p8 целиком), CERTIFICATE_PRIVATE_KEY (RSA-ключ сертификата)
+#                                           — появятся после членства Apple; без них workflow только проверяет сборку
+# Переменные (Settings → Variables): BUNDLE_ID, API_BASE_URL, APP_STORE_APPLE_ID (числовой id карточки, необязательно)
+name: ios
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины"
+        type: choice
+        options: [testflight, build-check, metadata]
+        default: testflight
+      ref:
+        description: Ветка закрытого репо
+        type: string
+        default: release/ios-appstore
+      run_tests:
+        description: Прогнать flutter test (дольше на ~10 мин)
+        type: boolean
+        default: false
+
+# только по кнопке/API — ни push, ни pull_request: чужие PR не получают ни секретов, ни запуска
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-${{ inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  ios:
+    runs-on: macos-26
+    timeout-minutes: 75
+    env:
+      MODE: ${{ inputs.mode }}
+      BUNDLE_ID: ${{ vars.BUNDLE_ID }}
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+      APP_STORE_APPLE_ID: ${{ vars.APP_STORE_APPLE_ID }}
+      FLUTTER_VERSION: 3.47.7   # та же версия, что собрала Android 0.2.0
+      APP_DIR: ${{ github.workspace }}/app
+    steps:
+      - name: Скрипты сборщика
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Проверка секретов
+        id: pre
+        env:
+          HAS_REPO: ${{ secrets.ONETAP_REPO != '' && secrets.ONETAP_DEPLOY_KEY != '' }}
+          HAS_ASC: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID != '' && secrets.APP_STORE_CONNECT_KEY_IDENTIFIER != '' && secrets.APP_STORE_CONNECT_PRIVATE_KEY != '' && secrets.CERTIFICATE_PRIVATE_KEY != '' }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_REPO" != "true" ]; then
+            echo "::error title=Нет доступа к коду::нужны секреты ONETAP_REPO и ONETAP_DEPLOY_KEY"; exit 1
+          fi
+          [ -n "$BUNDLE_ID" ] && [ -n "$API_BASE_URL" ] || { echo "::error title=Нет переменных::нужны BUNDLE_ID и API_BASE_URL"; exit 1; }
+          sign=false
+          if [ "$MODE" != "build-check" ]; then
+            if [ "$HAS_ASC" = "true" ]; then
+              sign=true
+            else
+              # идея: ключа Apple ещё нет — не падаем непонятно, а проверяем сборку и ясно пишем, чего ждём
+              echo "::warning title=Ждёт ключ App Store Connect::нет секретов APP_STORE_CONNECT_* / CERTIFICATE_PRIVATE_KEY — подпись и загрузка пропущены, делаю только проверку сборки"
+            fi
+          fi
+          echo "sign=$sign" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE, подпись=$sign"
+
+      - name: Код приложения (закрытый репо, только чтение)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.ONETAP_REPO }}
+          ssh-key: ${{ secrets.ONETAP_DEPLOY_KEY }}
+          ref: ${{ inputs.ref }}
+          path: app
+          persist-credentials: false
+          show-progress: false
+
+      - name: Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          # кэш только SDK и пакетов pub.dev (публичное); сборку и Pods не кэшируем — там скомпилированный код
+          cache: true
+
+      - name: Зависимости
+        working-directory: app
+        run: $GITHUB_WORKSPACE/scripts/quiet.sh pub-get flutter pub get
+
+      - name: Анализ
+        if: inputs.mode != 'metadata'
+        working-directory: app
+        run: $GITHUB_WORKSPACE/scripts/quiet.sh analyze flutter analyze --fatal-infos
+
+      - name: Тесты
+        if: inputs.run_tests && inputs.mode != 'metadata'
+        working-directory: app
+        run: $GITHUB_WORKSPACE/scripts/quiet.sh tests flutter test
+
+      - name: Сборка без подписи (проверка)
+        if: steps.pre.outputs.sign != 'true' && inputs.mode != 'metadata'
+        working-directory: app
+        run: |
+          $GITHUB_WORKSPACE/scripts/quiet.sh build-ios-nocodesign \
+            flutter build ios --release --no-codesign \
+              --dart-define=ONETAP_API_BASE_URL="$API_BASE_URL" \
+              --dart-define=ONETAP_ALLOW_PREVIEW=true
+
+      # ---------- дальше — только когда есть ключ App Store Connect ----------
+
+      - name: Инструменты подписи (codemagic-cli-tools, открытые)
+        if: steps.pre.outputs.sign == 'true' && inputs.mode == 'testflight'
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/cm"
+          $GITHUB_WORKSPACE/scripts/quiet.sh cm-install "$RUNNER_TEMP/cm/bin/pip" install --quiet codemagic-cli-tools
+          echo "$RUNNER_TEMP/cm/bin" >> "$GITHUB_PATH"
+
+      - name: Подпись App Store (сертификат и профиль через API, без Mac и без match)
+        if: steps.pre.outputs.sign == 'true' && inputs.mode == 'testflight'
+        working-directory: app
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          CERTIFICATE_PRIVATE_KEY: ${{ secrets.CERTIFICATE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          Q=$GITHUB_WORKSPACE/scripts/quiet.sh
+          # идея: постоянный CERTIFICATE_PRIVATE_KEY → каждый раз тот же сертификат, лимит сертификатов Apple не съедаем
+          $Q keychain-init keychain initialize
+          $Q fetch-signing app-store-connect fetch-signing-files "$BUNDLE_ID" --type IOS_APP_STORE --create
+          $Q keychain-add keychain add-certificates
+          $Q use-profiles xcode-project use-profiles
+
+      - name: Сборка IPA
+        if: steps.pre.outputs.sign == 'true' && inputs.mode == 'testflight'
+        working-directory: app
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          # номер сборки = последний в TestFlight + 1 (пока id карточки не вписан — номер запуска + 100)
+          LATEST=0
+          if [ -n "$APP_STORE_APPLE_ID" ]; then
+            LATEST=$(app-store-connect get-latest-testflight-build-number "$APP_STORE_APPLE_ID" 2>/dev/null | tail -1 | tr -dc '0-9' || true)
+            LATEST=${LATEST:-0}
+          fi
+          RUN=$(( GITHUB_RUN_NUMBER + 100 ))
+          NEXT=$(( LATEST + 1 > RUN ? LATEST + 1 : RUN ))
+          echo "номер сборки: $NEXT"
+          $GITHUB_WORKSPACE/scripts/quiet.sh build-ipa \
+            flutter build ipa --release \
+              --build-number="$NEXT" \
+              --export-options-plist="$HOME/export_options.plist" \
+              --dart-define=ONETAP_API_BASE_URL="$API_BASE_URL" \
+              --dart-define=ONETAP_ALLOW_PREVIEW=true
+
+      - name: Загрузка в TestFlight (внутренние тестировщики, на проверку Apple НЕ отправляет)
+        if: steps.pre.outputs.sign == 'true' && inputs.mode == 'testflight'
+        working-directory: app
+        env:
+          APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          APP_STORE_CONNECT_KEY_IDENTIFIER: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          IPA=$(find build/ios/ipa -name '*.ipa' | head -1)
+          [ -n "$IPA" ] || { echo "::error title=Нет IPA::сборка не дала файл"; exit 1; }
+          echo "размер IPA: $(( $(wc -c < "$IPA") / 1048576 )) МБ"
+          $GITHUB_WORKSPACE/scripts/quiet.sh upload app-store-connect publish --path "$IPA"
+
+      - name: Ruby (для fastlane deliver)
+        if: steps.pre.outputs.sign == 'true' && inputs.mode == 'metadata'
+        uses: ruby/setup-ruby@b1da4809b005e0178fe08a1d57317bffc00b7b4c # v1
+        with:
+          ruby-version: "3.3"
+          working-directory: app
+          bundler-cache: false
+
+      - name: Тексты и скрины App Store
+        if: steps.pre.outputs.sign == 'true' && inputs.mode == 'metadata'
+        working-directory: app
+        env:
+          ASC_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          ASC_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          P8: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          # Fastfile ждёт ключ в base64 под старыми именами
+          ASC_API_KEY_BASE64="$(printf '%s' "$P8" | base64 | tr -d '\n')"
+          echo "::add-mask::$ASC_API_KEY_BASE64"
+          export ASC_API_KEY_BASE64
+          export APP_VERSION="$(grep '^version:' pubspec.yaml | sed 's/version: *//; s/+.*//')"
+          export UPLOAD_SCREENSHOTS=true
+          $GITHUB_WORKSPACE/scripts/quiet.sh bundle-install bundle install
+          cd ios && $GITHUB_WORKSPACE/scripts/quiet.sh deliver bundle exec fastlane ios upload_store_metadata
+
+      # ---------- итог и уборка ----------
+
+      - name: Итог
+        if: always()
+        run: |
+          {
+            echo "### iOS: ${MODE}"
+            echo "- ветка: \`${{ inputs.ref }}\`"
+            echo "- подпись и загрузка: ${{ steps.pre.outputs.sign == 'true' && 'да' || 'нет (ждёт ключ App Store Connect или режим build-check)' }}"
+            echo "- результат: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Зашифровать логи
+        if: failure()
+        run: $GITHUB_WORKSPACE/scripts/encrypt-logs.sh
+
+      - name: Зашифрованный лог (артефакт на 2 дня)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-encrypted
+          path: ${{ runner.temp }}/logs.tgz.p7m
+          retention-days: 2
+          if-no-files-found: ignore
+
+      - name: Уборка
+        if: always()
+        run: |
+          # машина одноразовая, но ключи и код всё равно стираем сразу
+          rm -rf "$APP_DIR" "$RUNNER_TEMP/logs" "$HOME/.appstoreconnect" "$HOME/export_options.plist" || true
+          command -v keychain >/dev/null && keychain use-login >/dev/null 2>&1 || true
