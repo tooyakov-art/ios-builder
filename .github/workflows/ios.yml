@@ -87,8 +87,10 @@ jobs:
           set -euo pipefail
           X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
           [ -n "$X" ] && sudo xcode-select -s "$X"
-          xcodebuild -version | head -1
-          xcodebuild -version | grep -qE '^Xcode 2[6-9]' || { echo "::error title=Нет Xcode 26::на раннере ${{ runner.os }} нет Xcode 26 — выбери другой runner"; exit 1; }
+          # вывод — в переменную: xcodebuild падает (SIGPIPE), если пайп закрыть раньше (head -1, grep -q)
+          V=$(xcodebuild -version)
+          echo "$V"
+          case "$V" in Xcode\ 2[6-9]*) ;; *) echo "::error title=Нет Xcode 26::на раннере ${{ runner.os }} нет Xcode 26 ($(ls -d /Applications/Xcode*.app | xargs -n1 basename | tr '\n' ' ')) — выбери другой runner"; exit 1;; esac
 
       - name: Код приложения (закрытый репо, только чтение)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
