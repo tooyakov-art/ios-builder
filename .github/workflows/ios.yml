@@ -26,6 +26,11 @@ on:
         description: Прогнать flutter test (дольше на ~10 мин)
         type: boolean
         default: false
+      runner:
+        description: Раннер macOS (если долго в очереди — сменить; нужен Xcode 26)
+        type: choice
+        options: [macos-latest, macos-15, macos-26-intel, macos-15-intel, macos-26]
+        default: macos-latest
 
 # только по кнопке/API — ни push, ни pull_request: чужие PR не получают ни секретов, ни запуска
 permissions:
@@ -37,7 +42,8 @@ concurrency:
 
 jobs:
   ios:
-    runs-on: macos-26
+    # macos-26 (arm64) 21.10 не дали за 15 мин — «capacity constraints»; macos-latest взялся за секунды
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 75
     env:
       MODE: ${{ inputs.mode }}
