@@ -29,8 +29,8 @@ on:
       runner:
         description: Раннер macOS (если долго в очереди — сменить; нужен Xcode 26)
         type: choice
-        options: [macos-latest, macos-15, macos-26-intel, macos-15-intel, macos-26]
-        default: macos-latest
+        options: [macos-15-intel, macos-latest, macos-15, macos-26]
+        default: macos-15-intel
 
 # только по кнопке/API — ни push, ни pull_request: чужие PR не получают ни секретов, ни запуска
 permissions:
@@ -42,8 +42,8 @@ concurrency:
 
 jobs:
   ios:
-    # macos-26 (arm64) 21.10 не дали за 15 мин — «capacity constraints»; macos-latest взялся за секунды
-    runs-on: ${{ inputs.runner || 'macos-latest' }}
+    # 21.10: arm64 (macos-26 / macos-latest) не выдали за 15 мин — «capacity constraints»; Intel взялся за секунды
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 75
     env:
       MODE: ${{ inputs.mode }}
@@ -80,6 +80,15 @@ jobs:
           fi
           echo "sign=$sign" >> "$GITHUB_OUTPUT"
           echo "mode=$MODE, подпись=$sign"
+
+      - name: Xcode 26 (Apple с 04.2026 принимает только сборки на SDK iOS 26)
+        if: inputs.mode != 'metadata'
+        run: |
+          set -euo pipefail
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$X" ] && sudo xcode-select -s "$X"
+          xcodebuild -version | head -1
+          xcodebuild -version | grep -qE '^Xcode 2[6-9]' || { echo "::error title=Нет Xcode 26::на раннере ${{ runner.os }} нет Xcode 26 — выбери другой runner"; exit 1; }
 
       - name: Код приложения (закрытый репо, только чтение)
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
