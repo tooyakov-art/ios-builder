@@ -14,14 +14,18 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины"
+        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск)"
         type: choice
-        options: [testflight, build-check, metadata]
+        options: [testflight, build-check, metadata, submit]
         default: testflight
       ref:
         description: Ветка закрытого репо
         type: string
         default: release/ios-appstore
+      build_number:
+        description: Номер сборки TestFlight для режима submit (latest = последняя)
+        type: string
+        default: latest
       run_tests:
         description: Прогнать flutter test (дольше на ~10 мин)
         type: boolean
@@ -82,7 +86,7 @@ jobs:
           echo "mode=$MODE, подпись=$sign"
 
       - name: Xcode 26 (Apple с 04.2026 принимает только сборки на SDK iOS 26)
-        if: inputs.mode != 'metadata'
+        if: inputs.mode != 'metadata' && inputs.mode != 'submit'
         run: |
           set -euo pipefail
           X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
@@ -115,17 +119,17 @@ jobs:
         run: $GITHUB_WORKSPACE/scripts/quiet.sh pub-get flutter pub get
 
       - name: Анализ
-        if: inputs.mode != 'metadata'
+        if: inputs.mode != 'metadata' && inputs.mode != 'submit'
         working-directory: app
         run: $GITHUB_WORKSPACE/scripts/quiet.sh analyze flutter analyze --fatal-infos
 
       - name: Тесты
-        if: inputs.run_tests && inputs.mode != 'metadata'
+        if: inputs.run_tests && inputs.mode != 'metadata' && inputs.mode != 'submit'
         working-directory: app
         run: $GITHUB_WORKSPACE/scripts/quiet.sh tests flutter test
 
       - name: Сборка без подписи (проверка)
-        if: steps.pre.outputs.sign != 'true' && inputs.mode != 'metadata'
+        if: steps.pre.outputs.sign != 'true' && inputs.mode != 'metadata' && inputs.mode != 'submit'
         working-directory: app
         run: |
           $GITHUB_WORKSPACE/scripts/quiet.sh build-ios-nocodesign \
@@ -200,7 +204,7 @@ jobs:
           $GITHUB_WORKSPACE/scripts/quiet.sh upload app-store-connect publish --path "$IPA"
 
       - name: Ruby (для fastlane deliver)
-        if: steps.pre.outputs.sign == 'true' && inputs.mode == 'metadata'
+        if: steps.pre.outputs.sign == 'true' && (inputs.mode == 'metadata' || inputs.mode == 'submit')
         uses: ruby/setup-ruby@b1da4809b005e0178fe08a1d57317bffc00b7b4c # v1
         with:
           ruby-version: "3.3"
@@ -208,12 +212,17 @@ jobs:
           bundler-cache: false
 
       - name: Тексты и скрины App Store
-        if: steps.pre.outputs.sign == 'true' && inputs.mode == 'metadata'
+        if: steps.pre.outputs.sign == 'true' && (inputs.mode == 'metadata' || inputs.mode == 'submit')
         working-directory: app
         env:
           ASC_API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
           ASC_API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
           P8: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          APPLE_REVIEW_EMAIL: ${{ secrets.APPLE_REVIEW_EMAIL }}
+          APPLE_REVIEW_PASSWORD: ${{ secrets.APPLE_REVIEW_PASSWORD }}
+          APPLE_REVIEW_NOTES: "Free B2B ordering app, no paid content or IAP. To sign in as a reviewer: on the login screen tap «Войти по email и паролю» (Sign in with email and password) and use the demo account. Phone-code login sends the code to Telegram and is not available to reviewers."
+          BUILD_NUMBER: ${{ inputs.build_number }}
+          BRAND_RIGHTS_CONFIRMED: "true"
         run: |
           set -euo pipefail
           # Fastfile ждёт ключ в base64 под старыми именами
@@ -221,9 +230,21 @@ jobs:
           echo "::add-mask::$ASC_API_KEY_BASE64"
           export ASC_API_KEY_BASE64
           export APP_VERSION="$(grep '^version:' pubspec.yaml | sed 's/version: *//; s/+.*//')"
-          export UPLOAD_SCREENSHOTS=true
+          export UPLOAD_SCREENSHOTS=$([ "$MODE" = metadata ] && echo true || echo false)
           $GITHUB_WORKSPACE/scripts/quiet.sh bundle-install bundle install
-          cd ios && $GITHUB_WORKSPACE/scripts/quiet.sh deliver bundle exec fastlane ios upload_store_metadata
+          cd ios
+          # при падении — хвост лога без строк с данными ревьюера (репо и лог публичные)
+          tailsafe() { tail -n 60 "$RUNNER_TEMP"/logs/*-"$1".log | grep -iv 'password\|demo_\|APPLE_REVIEW' || true; }
+          $GITHUB_WORKSPACE/scripts/quiet.sh deliver bundle exec fastlane ios upload_store_metadata || { tailsafe deliver; exit 1; }
+          if [ "$MODE" = submit ]; then
+            $GITHUB_WORKSPACE/scripts/quiet.sh submit bundle exec fastlane ios submit_review || { tailsafe submit; exit 1; }
+            # проверка: состояние версий в App Store Connect (версия, статус, сборка — не секрет)
+            bundle exec ruby -r spaceship -r base64 -e '
+              Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(key_id: ENV["ASC_API_KEY_ID"], issuer_id: ENV["ASC_API_ISSUER_ID"], key: Base64.decode64(ENV["ASC_API_KEY_BASE64"]))
+              app = Spaceship::ConnectAPI::App.find(ENV["BUNDLE_ID"])
+              app.get_app_store_versions(includes: "build").each { |v| st = v.respond_to?(:app_version_state) && v.app_version_state ? v.app_version_state : v.app_store_state; puts "ASC: #{v.version_string} #{st} build=#{v.build && v.build.version}" }
+            ' || echo "::warning::проверка состояния версии не удалась (отправка выше прошла)"
+          fi
 
       # ---------- итог и уборка ----------
 
