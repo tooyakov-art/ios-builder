@@ -236,14 +236,22 @@ jobs:
           # при падении — хвост лога без строк с данными ревьюера (репо и лог публичные)
           tailsafe() { tail -n 60 "$RUNNER_TEMP"/logs/*-"$1".log | grep -iv 'password\|demo_\|APPLE_REVIEW' || true; }
           $GITHUB_WORKSPACE/scripts/quiet.sh deliver bundle exec fastlane ios upload_store_metadata || { tailsafe deliver; exit 1; }
-          if [ "$MODE" = submit ]; then
-            $GITHUB_WORKSPACE/scripts/quiet.sh submit bundle exec fastlane ios submit_review || { tailsafe submit; exit 1; }
-            # проверка: состояние версий в App Store Connect (версия, статус, сборка — не секрет)
-            bundle exec ruby -r spaceship -r base64 -e '
+          # состояние версий в App Store Connect (версия, статус, сборка, «Что нового» — не секрет)
+          asc_state() { bundle exec ruby -r spaceship -r base64 -e '
               Spaceship::ConnectAPI.token = Spaceship::ConnectAPI::Token.create(key_id: ENV["ASC_API_KEY_ID"], issuer_id: ENV["ASC_API_ISSUER_ID"], key: Base64.decode64(ENV["ASC_API_KEY_BASE64"]))
               app = Spaceship::ConnectAPI::App.find(ENV["BUNDLE_ID"])
-              app.get_app_store_versions(includes: "build").each { |v| st = v.respond_to?(:app_version_state) && v.app_version_state ? v.app_version_state : v.app_store_state; puts "ASC: #{v.version_string} #{st} build=#{v.build && v.build.version}" }
-            ' || echo "::warning::проверка состояния версии не удалась (отправка выше прошла)"
+              app.get_app_store_versions(includes: "build").each { |v|
+                st = v.respond_to?(:app_version_state) && v.app_version_state ? v.app_version_state : v.app_store_state
+                puts "ASC: #{v.version_string} #{st} build=#{v.build && v.build.version}"
+                next unless v.version_string == ENV["APP_VERSION"]
+                v.get_app_store_version_localizations.each { |l| puts "ASC-loc: #{l.locale} whatsNew=#{l.whats_new.to_s.gsub("\n", " / ")[0, 90]}" }
+              }' 2>&1 | grep '^ASC'; }
+          if [ "$MODE" = submit ]; then
+            asc_state | tee "$RUNNER_TEMP/asc-state.txt"
+            # замок: без русского «Что нового» новой версии не отправляем
+            grep -q '^ASC-loc: ru.*Демо-режим' "$RUNNER_TEMP/asc-state.txt" || { echo "::error title=Нет русского «Что нового»::в ASC у $APP_VERSION нет русского текста — отправку не делаю"; exit 1; }
+            $GITHUB_WORKSPACE/scripts/quiet.sh submit bundle exec fastlane ios submit_review || { tailsafe submit; exit 1; }
+            asc_state || echo "::warning::проверка состояния после отправки не удалась (отправка выше прошла)"
           fi
 
       # ---------- итог и уборка ----------
