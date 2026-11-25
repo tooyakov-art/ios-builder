@@ -8,16 +8,16 @@
 #   APP_STORE_CONNECT_PRIVATE_KEY (.p8 целиком), CERTIFICATE_PRIVATE_KEY (RSA-ключ сертификата)
 #                                           — появятся после членства Apple; без них workflow только проверяет сборку
 # Переменные (Settings → Variables): BUNDLE_ID, API_BASE_URL, APP_STORE_APPLE_ID (числовой id карточки, необязательно)
-# simtest (25.11): поле номера на симуляторе iPhone — XCUITest из папки simtest/, наружу только скрины и текст (1 день).
+# simtest / emutest (25.11): поле номера на симуляторе iPhone (XCUITest) и эмуляторе Android — из папки simtest/, наружу только скрины и текст (1 день).
 name: ios
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск) · status = только прочитать состояние версии в App Store Connect · release = выпустить одобренную версию release_version в App Store · simtest = поле номера на симуляторе iPhone (XCUITest, экранная клавиатура)"
+        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск) · status = только прочитать состояние версии в App Store Connect · release = выпустить одобренную версию release_version в App Store · simtest = поле номера на симуляторе iPhone (XCUITest, экранная клавиатура) · emutest = то же на эмуляторе Android"
         type: choice
-        options: [testflight, build-check, metadata, submit, status, release, simtest]
+        options: [testflight, build-check, metadata, submit, status, release, simtest, emutest]
         default: testflight
       simtest_submit:
         description: Для simtest — нажать «Получить код» на тестовом номере +7 700 000 19 19 (запрос на прод; не чаще раза в минуту)
@@ -51,12 +51,12 @@ permissions:
 
 concurrency:
   # simtest разных веток идут параллельно (0.2.1 и 0.2.2 сравниваем рядом); остальные режимы — по одному, как раньше
-  group: ios-${{ inputs.mode }}${{ inputs.mode == 'simtest' && format('-{0}', inputs.ref) || '' }}
+  group: ios-${{ inputs.mode }}${{ (inputs.mode == 'simtest' || inputs.mode == 'emutest') && format('-{0}', inputs.ref) || '' }}
   cancel-in-progress: false
 
 jobs:
   ios:
-    if: ${{ inputs.mode != 'status' && inputs.mode != 'release' && inputs.mode != 'simtest' }}   # 25.11: status, release и simtest — отдельные задачи ниже
+    if: ${{ inputs.mode != 'status' && inputs.mode != 'release' && inputs.mode != 'simtest' && inputs.mode != 'emutest' }}   # 25.11: status, release, simtest, emutest — отдельные задачи ниже
     # 21.10: arm64 (macos-26 / macos-latest) не выдали за 15 мин — «capacity constraints»; Intel взялся за секунды
     runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 75
@@ -536,3 +536,110 @@ jobs:
         run: |
           xcrun simctl shutdown all >/dev/null 2>&1 || true
           rm -rf "$GITHUB_WORKSPACE/app" "$RUNNER_TEMP/dd" "$RUNNER_TEMP/simtest.xcresult" "$RUNNER_TEMP/logs" || true
+
+  # 25.11 (0.2.2): то же на Android — эмулятор из образа раннера (sdkmanager, avdmanager, emulator; KVM), без чужих actions.
+  # Сборка release только под x86_64 и с отладочной подписью — для эмулятора, не для Google Play. Наружу — только скрины и текст.
+  emutest:
+    if: ${{ inputs.mode == 'emutest' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 80
+    env:
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+      FLUTTER_VERSION: 3.47.7
+      SIMTEST_SUBMIT: ${{ inputs.simtest_submit && 'true' || 'false' }}
+      IMG: system-images;android-35;google_apis;x86_64
+    steps:
+      - name: Скрипты сборщика
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Код приложения (закрытый репо, только чтение)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.ONETAP_REPO }}
+          ssh-key: ${{ secrets.ONETAP_DEPLOY_KEY }}
+          ref: ${{ inputs.ref }}
+          path: app
+          persist-credentials: false
+          show-progress: false
+
+      - name: Версия приложения
+        working-directory: app
+        run: |
+          echo "версия $(grep '^version:' pubspec.yaml | sed 's/version: *//'), коммит $(git rev-parse --short HEAD)"
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+
+      - name: Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Зависимости
+        working-directory: app
+        run: $GITHUB_WORKSPACE/scripts/quiet.sh pub-get flutter pub get
+
+      - name: APK для эмулятора (release, x86_64, флаги как у сторов)
+        working-directory: app
+        run: |
+          $GITHUB_WORKSPACE/scripts/quiet.sh build-apk \
+            flutter build apk --release --target-platform android-x64 \
+              --dart-define=ONETAP_API_BASE_URL="$API_BASE_URL" \
+              --dart-define=ONETAP_ALLOW_PREVIEW=true
+
+      - name: Эмулятор Android (KVM, образ из sdkmanager)
+        run: |
+          set -euo pipefail
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+          B="$ANDROID_HOME/cmdline-tools/latest/bin"
+          $GITHUB_WORKSPACE/scripts/quiet.sh sdk-image bash -c "yes | '$B/sdkmanager' --install '$IMG' emulator platform-tools"
+          echo no | "$B/avdmanager" create avd -n onetap -k "$IMG" -d pixel_6 >/dev/null
+          nohup "$ANDROID_HOME/emulator/emulator" -avd onetap -no-window -no-audio -no-boot-anim -no-snapshot \
+            -gpu swiftshader_indirect -camera-back none -camera-front none >"$RUNNER_TEMP/emulator.log" 2>&1 &
+          adb wait-for-device
+          for i in $(seq 1 150); do
+            [ "$(adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')" = 1 ] && break
+            sleep 3
+          done
+          adb shell getprop sys.boot_completed
+          adb shell settings put global window_animation_scale 0
+          adb shell settings put global transition_animation_scale 0
+          adb shell settings put global animator_duration_scale 0
+          adb shell input keyevent 82 || true
+          echo "Android $(adb shell getprop ro.build.version.release | tr -d '\r'), клавиатура: $(adb shell settings get secure default_input_method | tr -d '\r')"
+
+      - name: Набор, стирание, «Получить код» (Android)
+        run: |
+          set -uo pipefail
+          adb install -r app/build/app/outputs/flutter-apk/app-release.apk >/dev/null
+          bash "$GITHUB_WORKSPACE/simtest/android_phone.sh" "$RUNNER_TEMP/simtest" "$SIMTEST_SUBMIT"
+
+      - name: Результат
+        if: always()
+        run: |
+          {
+            echo "### emutest: \`${{ inputs.ref }}\`"
+            [ -f "$RUNNER_TEMP/simtest/result-a.txt" ] && { echo '```'; cat "$RUNNER_TEMP/simtest/result-a.txt"; echo '```'; }
+          } >> "$GITHUB_STEP_SUMMARY"
+          ls "$RUNNER_TEMP/simtest" 2>/dev/null || true
+
+      - name: Скрины (артефакт на 1 день — только PNG и текст)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: emutest-shots
+          path: |
+            ${{ runner.temp }}/simtest/*.png
+            ${{ runner.temp }}/simtest/*.txt
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Уборка
+        if: always()
+        run: |
+          adb emu kill >/dev/null 2>&1 || true
+          rm -rf "$GITHUB_WORKSPACE/app" "$RUNNER_TEMP/logs" || true
