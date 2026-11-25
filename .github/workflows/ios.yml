@@ -14,10 +14,14 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск) · status = только прочитать состояние версии в App Store Connect"
+        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск) · status = только прочитать состояние версии в App Store Connect · release = выпустить одобренную версию release_version в App Store"
         type: choice
-        options: [testflight, build-check, metadata, submit, status]
+        options: [testflight, build-check, metadata, submit, status, release]
         default: testflight
+      release_version:
+        description: Версия для режима release (например 0.2.1) — выпускается, только если Apple одобрила и она ждёт выпуска разработчиком
+        type: string
+        default: ""
       ref:
         description: Ветка закрытого репо
         type: string
@@ -46,7 +50,7 @@ concurrency:
 
 jobs:
   ios:
-    if: ${{ inputs.mode != 'status' }}   # 25.11: status — отдельная лёгкая задача ниже
+    if: ${{ inputs.mode != 'status' && inputs.mode != 'release' }}   # 25.11: status и release — отдельные лёгкие задачи ниже
     # 21.10: arm64 (macos-26 / macos-latest) не выдали за 15 мин — «capacity constraints»; Intel взялся за секунды
     runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 75
@@ -311,4 +315,58 @@ jobs:
             for (const x of v.data || []) console.log("ASC:", x.attributes.versionString, x.attributes.appVersionState || "", x.attributes.appStoreState || "", x.attributes.releaseType || "", x.attributes.createdDate || "");
             const r = await g("apps/" + process.env.APP + "/reviewSubmissions?filter[platform]=IOS&limit=3");
             for (const x of r.data || []) console.log("REVIEW:", x.attributes.state, x.attributes.submittedDate || "");
+          })().catch((e) => { console.log("ошибка:", e.message); process.exit(1); });'
+
+  # 25.11: выпуск одобренной версии iOS (releaseType MANUAL) — правило Диаса: iPhone и Android выходят вместе.
+  # Выпускает только версию из release_version и только из PENDING_DEVELOPER_RELEASE; сборку, тексты и отправку не трогает.
+  release:
+    if: ${{ inputs.mode == 'release' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Выпуск одобренной версии в App Store
+        env:
+          ISS: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KID: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          P8: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          APP: ${{ vars.APP_STORE_APPLE_ID || '6829345779' }}
+          VER: ${{ inputs.release_version }}
+        run: |
+          node -e '
+          const c = require("crypto"), b = (o) => Buffer.from(JSON.stringify(o)).toString("base64url"), now = Math.floor(Date.now() / 1000);
+          const h = b({ alg: "ES256", kid: process.env.KID, typ: "JWT" }), p = b({ iss: process.env.ISS, iat: now, exp: now + 900, aud: "appstoreconnect-v1" });
+          const t = h + "." + p + "." + c.sign("sha256", Buffer.from(h + "." + p), { key: process.env.P8, dsaEncoding: "ieee-p1363" }).toString("base64url");
+          const api = async (u, body) => {
+            const r = await fetch("https://api.appstoreconnect.apple.com/v1/" + u, body
+              ? { method: "POST", headers: { authorization: "Bearer " + t, "content-type": "application/json" }, body: JSON.stringify(body) }
+              : { headers: { authorization: "Bearer " + t } });
+            return { status: r.status, j: await r.json().catch(() => ({})) };
+          };
+          const show = (x) => console.log("ASC:", x.attributes.versionString, x.attributes.appVersionState || "", x.attributes.appStoreState || "", x.attributes.releaseType || "", x.attributes.createdDate || "");
+          const list = async () => {
+            const { j } = await api("apps/" + process.env.APP + "/appStoreVersions?filter[platform]=IOS&limit=3&fields[appStoreVersions]=versionString,appStoreState,appVersionState,releaseType,createdDate");
+            if (j.errors) console.log("ASC-ошибка:", JSON.stringify(j.errors).slice(0, 300));
+            (j.data || []).forEach(show);
+            return j.data || [];
+          };
+          const ver = (process.env.VER || "").trim();
+          (async () => {
+            if (!/^\d+\.\d+\.\d+$/.test(ver)) { console.log("::error title=Нет версии::укажи release_version, например 0.2.1"); process.exit(1); }
+            console.log("до выпуска:");
+            const v = (await list()).find((x) => x.attributes.versionString === ver);
+            if (!v) { console.log("::error title=Нет версии::" + ver + " (iOS) нет в App Store Connect"); process.exit(1); }
+            const st = v.attributes.appVersionState || v.attributes.appStoreState;
+            if (st !== "PENDING_DEVELOPER_RELEASE") { console.log("::error title=Не ждёт выпуска::" + ver + " в состоянии " + st + " — выпуск не делаю"); process.exit(1); }
+            const r = await api("appStoreVersionReleaseRequests", { data: { type: "appStoreVersionReleaseRequests", relationships: { appStoreVersion: { data: { type: "appStoreVersions", id: v.id } } } } });
+            console.log("RELEASE:", r.status, r.j.data ? "request=" + r.j.data.id : "", r.j.errors ? JSON.stringify(r.j.errors).slice(0, 400) : "");
+            if (r.status !== 201) process.exit(1);
+            // дальше Apple сама: PROCESSING_FOR_DISTRIBUTION → READY_FOR_DISTRIBUTION (обычно минуты)
+            for (let i = 1; i <= 12; i++) {
+              await new Promise((ok) => setTimeout(ok, 15000));
+              const a = ((await api("appStoreVersions/" + v.id + "?fields[appStoreVersions]=versionString,appStoreState,appVersionState")).j.data || {}).attributes || {};
+              console.log("через", i * 15, "с:", a.versionString, a.appVersionState || "", a.appStoreState || "");
+              if (a.appVersionState === "READY_FOR_DISTRIBUTION" || a.appStoreState === "READY_FOR_SALE") break;
+            }
+            console.log("после выпуска:");
+            await list();
           })().catch((e) => { console.log("ошибка:", e.message); process.exit(1); });'
