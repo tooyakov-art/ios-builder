@@ -319,20 +319,21 @@ jobs:
 
   # 25.11: выпуск одобренной версии iOS (releaseType MANUAL) — правило Диаса: iPhone и Android выходят вместе.
   # Выпускает только версию из release_version и только из PENDING_DEVELOPER_RELEASE; сборку, тексты и отправку не трогает.
+  # Шаги раздельно: «Выпуск» зелёный = Apple приняла запрос (201) — по нему сразу жмём «Опубликовать» в Google Play.
   release:
     if: ${{ inputs.mode == 'release' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      ISS: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      KID: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+      P8: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      APP: ${{ vars.APP_STORE_APPLE_ID || '6829345779' }}
+      VER: ${{ inputs.release_version }}
     steps:
-      - name: Выпуск одобренной версии в App Store
-        env:
-          ISS: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
-          KID: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
-          P8: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
-          APP: ${{ vars.APP_STORE_APPLE_ID || '6829345779' }}
-          VER: ${{ inputs.release_version }}
+      - name: Скрипт App Store Connect
         run: |
-          node -e '
+          cat > "$RUNNER_TEMP/asc.js" <<'JS'
           const c = require("crypto"), b = (o) => Buffer.from(JSON.stringify(o)).toString("base64url"), now = Math.floor(Date.now() / 1000);
           const h = b({ alg: "ES256", kid: process.env.KID, typ: "JWT" }), p = b({ iss: process.env.ISS, iat: now, exp: now + 900, aud: "appstoreconnect-v1" });
           const t = h + "." + p + "." + c.sign("sha256", Buffer.from(h + "." + p), { key: process.env.P8, dsaEncoding: "ieee-p1363" }).toString("base64url");
@@ -349,18 +350,21 @@ jobs:
             (j.data || []).forEach(show);
             return j.data || [];
           };
-          const ver = (process.env.VER || "").trim();
+          const ver = (process.env.VER || "").trim(), step = process.argv[2];
           (async () => {
             if (!/^\d+\.\d+\.\d+$/.test(ver)) { console.log("::error title=Нет версии::укажи release_version, например 0.2.1"); process.exit(1); }
-            console.log("до выпуска:");
+            console.log(step === "release" ? "до выпуска:" : "сейчас:");
             const v = (await list()).find((x) => x.attributes.versionString === ver);
             if (!v) { console.log("::error title=Нет версии::" + ver + " (iOS) нет в App Store Connect"); process.exit(1); }
-            const st = v.attributes.appVersionState || v.attributes.appStoreState;
-            if (st !== "PENDING_DEVELOPER_RELEASE") { console.log("::error title=Не ждёт выпуска::" + ver + " в состоянии " + st + " — выпуск не делаю"); process.exit(1); }
-            const r = await api("appStoreVersionReleaseRequests", { data: { type: "appStoreVersionReleaseRequests", relationships: { appStoreVersion: { data: { type: "appStoreVersions", id: v.id } } } } });
-            console.log("RELEASE:", r.status, r.j.data ? "request=" + r.j.data.id : "", r.j.errors ? JSON.stringify(r.j.errors).slice(0, 400) : "");
-            if (r.status !== 201) process.exit(1);
-            // дальше Apple сама: PROCESSING_FOR_DISTRIBUTION → READY_FOR_DISTRIBUTION (обычно минуты)
+            if (step === "release") {
+              const st = v.attributes.appVersionState || v.attributes.appStoreState;
+              if (st !== "PENDING_DEVELOPER_RELEASE") { console.log("::error title=Не ждёт выпуска::" + ver + " в состоянии " + st + " — выпуск не делаю"); process.exit(1); }
+              const r = await api("appStoreVersionReleaseRequests", { data: { type: "appStoreVersionReleaseRequests", relationships: { appStoreVersion: { data: { type: "appStoreVersions", id: v.id } } } } });
+              console.log("RELEASE:", r.status, r.j.data ? "request=" + r.j.data.id : "", r.j.errors ? JSON.stringify(r.j.errors).slice(0, 400) : "");
+              if (r.status !== 201) process.exit(1);
+              return;
+            }
+            // после запроса Apple сама: PROCESSING_FOR_DISTRIBUTION → READY_FOR_DISTRIBUTION (обычно минуты)
             for (let i = 1; i <= 12; i++) {
               await new Promise((ok) => setTimeout(ok, 15000));
               const a = ((await api("appStoreVersions/" + v.id + "?fields[appStoreVersions]=versionString,appStoreState,appVersionState")).j.data || {}).attributes || {};
@@ -369,4 +373,11 @@ jobs:
             }
             console.log("после выпуска:");
             await list();
-          })().catch((e) => { console.log("ошибка:", e.message); process.exit(1); });'
+          })().catch((e) => { console.log("ошибка:", e.message); process.exit(1); });
+          JS
+
+      - name: Выпуск одобренной версии в App Store
+        run: node "$RUNNER_TEMP/asc.js" release
+
+      - name: Состояние после выпуска
+        run: node "$RUNNER_TEMP/asc.js" after
