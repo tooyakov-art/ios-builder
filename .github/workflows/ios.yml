@@ -479,7 +479,7 @@ jobs:
         env:
           UDID: ${{ steps.sim.outputs.udid }}
         run: |
-          set -uo pipefail
+          set +e -uo pipefail   # шаг сам решает код выхода: упавший тест не должен прятать строки результата
           mkdir -p "$RUNNER_TEMP/simtest" "$RUNNER_TEMP/logs"
           export TEST_RUNNER_SIMTEST_OUT="$RUNNER_TEMP/simtest"
           export TEST_RUNNER_SIMTEST_SUBMIT="$SIMTEST_SUBMIT"
@@ -625,7 +625,7 @@ jobs:
 
       - name: Набор, стирание, «Получить код» (Android)
         run: |
-          set -uo pipefail
+          set +e -uo pipefail
           adb install -r app/build/app/outputs/flutter-apk/app-release.apk >/dev/null
           bash "$GITHUB_WORKSPACE/simtest/android_phone.sh" "$RUNNER_TEMP/simtest" "$SIMTEST_SUBMIT"
 
