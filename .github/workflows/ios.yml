@@ -8,16 +8,21 @@
 #   APP_STORE_CONNECT_PRIVATE_KEY (.p8 целиком), CERTIFICATE_PRIVATE_KEY (RSA-ключ сертификата)
 #                                           — появятся после членства Apple; без них workflow только проверяет сборку
 # Переменные (Settings → Variables): BUNDLE_ID, API_BASE_URL, APP_STORE_APPLE_ID (числовой id карточки, необязательно)
+# simtest (25.11): поле номера на симуляторе iPhone — XCUITest из папки simtest/, наружу только скрины и текст (1 день).
 name: ios
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск) · status = только прочитать состояние версии в App Store Connect · release = выпустить одобренную версию release_version в App Store"
+        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск) · status = только прочитать состояние версии в App Store Connect · release = выпустить одобренную версию release_version в App Store · simtest = поле номера на симуляторе iPhone (XCUITest, экранная клавиатура)"
         type: choice
-        options: [testflight, build-check, metadata, submit, status, release]
+        options: [testflight, build-check, metadata, submit, status, release, simtest]
         default: testflight
+      simtest_submit:
+        description: Для simtest — нажать «Получить код» на тестовом номере +7 700 000 19 19 (запрос на прод; не чаще раза в минуту)
+        type: boolean
+        default: false
       release_version:
         description: Версия для режима release (например 0.2.1) — выпускается, только если Apple одобрила и она ждёт выпуска разработчиком
         type: string
@@ -45,12 +50,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: ios-${{ inputs.mode }}
+  # simtest разных веток идут параллельно (0.2.1 и 0.2.2 сравниваем рядом); остальные режимы — по одному, как раньше
+  group: ios-${{ inputs.mode }}${{ inputs.mode == 'simtest' && format('-{0}', inputs.ref) || '' }}
   cancel-in-progress: false
 
 jobs:
   ios:
-    if: ${{ inputs.mode != 'status' && inputs.mode != 'release' }}   # 25.11: status и release — отдельные лёгкие задачи ниже
+    if: ${{ inputs.mode != 'status' && inputs.mode != 'release' && inputs.mode != 'simtest' }}   # 25.11: status, release и simtest — отдельные задачи ниже
     # 21.10: arm64 (macos-26 / macos-latest) не выдали за 15 мин — «capacity constraints»; Intel взялся за секунды
     runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 75
@@ -253,8 +259,11 @@ jobs:
               }' 2>&1 | grep '^ASC'; }
           if [ "$MODE" = submit ]; then
             asc_state | tee "$RUNNER_TEMP/asc-state.txt"
-            # замок: без русского «Что нового» новой версии не отправляем
-            grep -q '^ASC-loc: ru.*Демо-режим' "$RUNNER_TEMP/asc-state.txt" || { echo "::error title=Нет русского «Что нового»::в ASC у $APP_VERSION нет русского текста — отправку не делаю"; exit 1; }
+            # замок: русское «Что нового» этой версии в ASC = первая строка ru-RU/release_notes.txt ветки
+            # (25.11, 0.2.2: раньше замок ждал текст 0.2.1 «Демо-режим»)
+            want=$(python3 -c 'import sys; print(open(sys.argv[1], encoding="utf-8").readline().strip()[:40])' fastlane/metadata/ru-RU/release_notes.txt)
+            [ -n "$want" ] || { echo "::error title=Нет русского «Что нового»::пустой ru-RU/release_notes.txt — отправку не делаю"; exit 1; }
+            grep -qF "ASC-loc: ru whatsNew=$want" "$RUNNER_TEMP/asc-state.txt" || { echo "::error title=Нет русского «Что нового»::в ASC у $APP_VERSION русский текст не совпал с веткой ($want) — отправку не делаю"; exit 1; }
             $GITHUB_WORKSPACE/scripts/quiet.sh submit bundle exec fastlane ios submit_review || { tailsafe submit; exit 1; }
             asc_state || echo "::warning::проверка состояния после отправки не удалась (отправка выше прошла)"
           fi
@@ -381,3 +390,149 @@ jobs:
 
       - name: Состояние после выпуска
         run: node "$RUNNER_TEMP/asc.js" after
+
+  # 25.11 (0.2.2): поле номера на настоящем iOS — симулятор iPhone + XCUITest, пальцем по экранной клавиатуре.
+  # Сборка debug под симулятор с флагами сторов (прод-API); UI-тест добавляется только в копию проекта на машине.
+  # Наружу — только скрины и текст результата (артефакт на 1 день); код и сборка приложения не выкладываются.
+  simtest:
+    if: ${{ inputs.mode == 'simtest' }}
+    runs-on: ${{ inputs.runner || 'macos-15-intel' }}
+    timeout-minutes: 90
+    env:
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+      FLUTTER_VERSION: 3.47.7
+      SIMTEST_SUBMIT: ${{ inputs.simtest_submit && 'true' || 'false' }}
+    steps:
+      - name: Скрипты сборщика
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Xcode 26
+        run: |
+          set -euo pipefail
+          X=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1 || true)
+          [ -n "$X" ] && sudo xcode-select -s "$X"
+          V=$(xcodebuild -version)
+          echo "$V"
+
+      - name: Код приложения (закрытый репо, только чтение)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ secrets.ONETAP_REPO }}
+          ssh-key: ${{ secrets.ONETAP_DEPLOY_KEY }}
+          ref: ${{ inputs.ref }}
+          path: app
+          persist-credentials: false
+          show-progress: false
+
+      - name: Версия приложения
+        working-directory: app
+        run: |
+          echo "версия $(grep '^version:' pubspec.yaml | sed 's/version: *//'), коммит $(git rev-parse --short HEAD)"
+
+      - name: Flutter
+        uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Зависимости
+        working-directory: app
+        run: $GITHUB_WORKSPACE/scripts/quiet.sh pub-get flutter pub get
+
+      - name: Проект под симулятор (debug, флаги как у сторов)
+        working-directory: app
+        run: |
+          $GITHUB_WORKSPACE/scripts/quiet.sh sim-config \
+            flutter build ios --simulator --debug --config-only \
+              --dart-define=ONETAP_API_BASE_URL="$API_BASE_URL" \
+              --dart-define=ONETAP_ALLOW_PREVIEW=true
+
+      - name: UI-тест в копию проекта
+        working-directory: app/ios
+        run: |
+          set -euo pipefail
+          ruby -e 'require "xcodeproj"; puts "xcodeproj #{Xcodeproj::VERSION}, ruby #{RUBY_VERSION}"'
+          ruby "$GITHUB_WORKSPACE/simtest/add_uitest_target.rb" "$GITHUB_WORKSPACE/simtest"
+
+      - name: Симулятор iPhone (экранная клавиатура)
+        id: sim
+        run: |
+          set -euo pipefail
+          PICK=$(xcrun simctl list devices available -j | python3 "$GITHUB_WORKSPACE/simtest/pick_sim.py")
+          read -r UDID RUNTIME NAME <<< "$PICK"
+          echo "симулятор: $NAME, iOS $RUNTIME"
+          # без аппаратной клавиатуры: набор идёт через экранную, как у людей
+          defaults write com.apple.iphonesimulator ConnectHardwareKeyboard -bool false
+          xcrun simctl boot "$UDID" 2>/dev/null || true
+          xcrun simctl bootstatus "$UDID" -b >/dev/null
+          echo "udid=$UDID" >> "$GITHUB_OUTPUT"
+          echo "name=$NAME, iOS $RUNTIME" >> "$GITHUB_OUTPUT"
+
+      - name: XCUITest — набор, стирание, «Получить код»
+        working-directory: app/ios
+        env:
+          UDID: ${{ steps.sim.outputs.udid }}
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/simtest" "$RUNNER_TEMP/logs"
+          export TEST_RUNNER_SIMTEST_OUT="$RUNNER_TEMP/simtest"
+          export TEST_RUNNER_SIMTEST_SUBMIT="$SIMTEST_SUBMIT"
+          LOG="$RUNNER_TEMP/logs/90-xcodebuild-test.log"
+          start=$(date +%s)
+          xcodebuild test -workspace Runner.xcworkspace -scheme Runner -configuration Debug \
+            -destination "id=$UDID" -only-testing:RunnerUITests \
+            -derivedDataPath "$RUNNER_TEMP/dd" -resultBundlePath "$RUNNER_TEMP/simtest.xcresult" >"$LOG" 2>&1
+          code=$?
+          echo "xcodebuild test: код $code, $(( $(date +%s) - start )) с"
+          # в публичный лог — только строки теста и ошибки без исходников приложения
+          grep -E "SIMTEST\[|Test [Cc]ase .*(passed|failed|skipped)|\*\* TEST|error:|Testing failed|failed to|Failed to" "$LOG" \
+            | grep -v -E "/app/lib/|/app/test/" | cut -c1-400 | head -150 || true
+          exit $code
+
+      - name: Результат и скрины
+        if: always()
+        run: |
+          xcrun xcresulttool export attachments --path "$RUNNER_TEMP/simtest.xcresult" --output-path "$RUNNER_TEMP/simtest/att" >/dev/null 2>&1 || echo "вложения из xcresult не выгрузились"
+          ls "$RUNNER_TEMP/simtest" "$RUNNER_TEMP/simtest/att" 2>/dev/null | head -60 || true
+          {
+            echo "### simtest: \`${{ inputs.ref }}\` — ${{ steps.sim.outputs.name }}"
+            for f in "$RUNNER_TEMP"/simtest/result-*.txt; do
+              [ -f "$f" ] && { echo '```'; cat "$f"; echo '```'; }
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP"/simtest/result-*.txt 2>/dev/null || echo "файлов результата нет"
+
+      - name: Скрины (артефакт на 1 день — только PNG и текст)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: simtest-shots
+          path: |
+            ${{ runner.temp }}/simtest/*.png
+            ${{ runner.temp }}/simtest/*.txt
+            ${{ runner.temp }}/simtest/att/*.png
+            ${{ runner.temp }}/simtest/att/*.txt
+          retention-days: 1
+          if-no-files-found: warn
+
+      - name: Зашифровать логи
+        if: failure()
+        run: $GITHUB_WORKSPACE/scripts/encrypt-logs.sh
+
+      - name: Зашифрованный лог (артефакт на 2 дня)
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: logs-encrypted
+          path: ${{ runner.temp }}/logs.tgz.p7m
+          retention-days: 2
+          if-no-files-found: ignore
+
+      - name: Уборка
+        if: always()
+        run: |
+          xcrun simctl shutdown all >/dev/null 2>&1 || true
+          rm -rf "$GITHUB_WORKSPACE/app" "$RUNNER_TEMP/dd" "$RUNNER_TEMP/simtest.xcresult" "$RUNNER_TEMP/logs" || true
