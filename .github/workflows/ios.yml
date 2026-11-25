@@ -14,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск)"
+        description: "build-check = сборка без подписи · testflight = подпись + загрузка · metadata = тексты и скрины · submit = тексты + отправка версии на проверку Apple (ручной выпуск) · status = только прочитать состояние версии в App Store Connect"
         type: choice
-        options: [testflight, build-check, metadata, submit]
+        options: [testflight, build-check, metadata, submit, status]
         default: testflight
       ref:
         description: Ветка закрытого репо
@@ -46,6 +46,7 @@ concurrency:
 
 jobs:
   ios:
+    if: ${{ inputs.mode != 'status' }}   # 25.11: status — отдельная лёгкая задача ниже
     # 21.10: arm64 (macos-26 / macos-latest) не выдали за 15 мин — «capacity constraints»; Intel взялся за секунды
     runs-on: ${{ inputs.runner || 'macos-15-intel' }}
     timeout-minutes: 75
@@ -285,3 +286,29 @@ jobs:
           # машина одноразовая, но ключи и код всё равно стираем сразу
           rm -rf "$APP_DIR" "$RUNNER_TEMP/logs" "$HOME/.appstoreconnect" "$HOME/export_options.plist" || true
           command -v keychain >/dev/null && keychain use-login >/dev/null 2>&1 || true
+
+  # 25.11: только чтение состояния версии iOS в App Store Connect (без сборки и отправки) — Диас: «App Store ещё не вышел? В чём проблема?»
+  status:
+    if: ${{ inputs.mode == 'status' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Состояние App Store Connect (только чтение)
+        env:
+          ISS: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+          KID: ${{ secrets.APP_STORE_CONNECT_KEY_IDENTIFIER }}
+          P8: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+          APP: ${{ vars.APP_STORE_APPLE_ID || '6829345779' }}
+        run: |
+          node -e '
+          const c = require("crypto"), b = (o) => Buffer.from(JSON.stringify(o)).toString("base64url"), now = Math.floor(Date.now() / 1000);
+          const h = b({ alg: "ES256", kid: process.env.KID, typ: "JWT" }), p = b({ iss: process.env.ISS, iat: now, exp: now + 600, aud: "appstoreconnect-v1" });
+          const t = h + "." + p + "." + c.sign("sha256", Buffer.from(h + "." + p), { key: process.env.P8, dsaEncoding: "ieee-p1363" }).toString("base64url");
+          const g = async (u) => (await fetch("https://api.appstoreconnect.apple.com/v1/" + u, { headers: { authorization: "Bearer " + t } })).json();
+          (async () => {
+            const v = await g("apps/" + process.env.APP + "/appStoreVersions?filter[platform]=IOS&limit=3&fields[appStoreVersions]=versionString,appStoreState,appVersionState,releaseType,createdDate");
+            if (v.errors) console.log("ASC-ошибка:", JSON.stringify(v.errors).slice(0, 300));
+            for (const x of v.data || []) console.log("ASC:", x.attributes.versionString, x.attributes.appVersionState || "", x.attributes.appStoreState || "", x.attributes.releaseType || "", x.attributes.createdDate || "");
+            const r = await g("apps/" + process.env.APP + "/reviewSubmissions?filter[platform]=IOS&limit=3");
+            for (const x of r.data || []) console.log("REVIEW:", x.attributes.state, x.attributes.submittedDate || "");
+          })().catch((e) => { console.log("ошибка:", e.message); process.exit(1); });'
