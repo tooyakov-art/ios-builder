@@ -80,6 +80,8 @@ opened=0
 for _ in $(seq 1 90); do
   x=$(dump)
   if printf '%s' "$x" | grep -q 'EditText'; then opened=1; break; fi
+  # системное окно эмулятора «… isn't responding» (не наше приложение) — жмём «Wait» и пробуем дальше
+  if c=$(printf '%s' "$x" | python3 "$HERE/ui_find.py" tap "Wait" 2>/dev/null); then adb shell input tap $c; sleep 2; continue; fi
   if c=$(printf '%s' "$x" | python3 "$HERE/ui_find.py" tap "Вход" 2>/dev/null); then
     adb shell input tap $c
     sleep 3
