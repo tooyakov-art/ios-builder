@@ -324,6 +324,9 @@ jobs:
             for (const x of v.data || []) console.log("ASC:", x.attributes.versionString, x.attributes.appVersionState || "", x.attributes.appStoreState || "", x.attributes.releaseType || "", x.attributes.createdDate || "");
             const r = await g("apps/" + process.env.APP + "/reviewSubmissions?filter[platform]=IOS&limit=3");
             for (const x of r.data || []) console.log("REVIEW:", x.attributes.state, x.attributes.submittedDate || "");
+            // 25.11: последние сборки TestFlight — номер и обработка (VALID = можно отправлять на проверку)
+            const bl = await g("builds?filter[app]=" + process.env.APP + "&sort=-uploadedDate&limit=3&fields[builds]=version,processingState,uploadedDate");
+            for (const x of bl.data || []) console.log("BUILD:", x.attributes.version, x.attributes.processingState || "", x.attributes.uploadedDate || "");
           })().catch((e) => { console.log("ошибка:", e.message); process.exit(1); });'
 
   # 25.11: выпуск одобренной версии iOS (releaseType MANUAL) — правило Диаса: iPhone и Android выходят вместе.
